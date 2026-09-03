@@ -156,7 +156,7 @@ A few things that bite newcomers: payloads crossing the worker boundary are JSON
 
 ### 1. Running the model
 
-1. Start the Vite dev server (`npm run dev`) from this directory (Vue 3 + Vite + TypeScript app; production build via `npm run build`).
+1. Start the Vite dev server with `npm run dev` from the **`explain-ui` repository root** — the directory this engine is mounted inside as a submodule. (The engine itself has no dependencies, no build step and no `dev` script; production build via `npm run build`, also from the app root.)
 2. The explain engine bootstraps via `src/composables/useExplain.ts`, a singleton that instantiates `Model` (imported as `@explain/Model`) and loads the default definition.
 3. Use UI buttons or call the engine wrapper returned by `useExplain()` (`model`) to `build`, `load`, `start`, `stop`, or `calculate(seconds)`.
 4. Place custom definitions under `model_definitions` and run `explain.load("definition_name")` (omit `.json`).
