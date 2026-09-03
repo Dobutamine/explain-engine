@@ -148,6 +148,16 @@ From `term_neonate.json` (a healthy term neonate — both septal openings closed
 
 ## Notes & caveats
 
+- **`diameter_fo` is NOT the lever for the atrial split.** At fetal sizes `res_fo` is ~13x lower
+  than the tricuspid valve's resistance, so the foramen is a hole rather than a restriction and the
+  two ventricles draw from a common atrial pressure. Measured on the fetal scenarios, 6.0 -> 3.0 mm
+  moves RV:LV by 0 points; it only bites below 2 mm, where it swings violently (1 mm -> 73:27).
+  `fo_lr_factor` likewise has no effect on the split. What sets it is which ventricle ejects better
+  — see [fetal_circulation.md](./fetal_circulation.md).
+- **`diameter_fo` and `atrial_septal_width` are absolute millimetres that no scaler touches.**
+  `atrial_septal_width` is the length term in the foramen's resistance law, so leaving it at term
+  thickness in a scaled-down body makes the foramen artificially restrictive; see
+  [fetal_circulation.md](./fetal_circulation.md).
 - **References resolve only once.** After the five resistors are cached, they are never re-resolved; a
   model added/removed at runtime would not be picked up. Missing wiring at first call is reported with
   a single console warning.

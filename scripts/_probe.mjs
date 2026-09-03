@@ -107,12 +107,60 @@ export const RANGES = {
     spo2_pre: [80, 93], svo2: [46, 82], temp: [36.5, 37.5], etco2: [30, 52],
     ph: [7.15, 7.32], pco2: [48, 70], po2: [35, 60], hco3: [15, 24], be: [-11, 2],
   },
+
+  // --- FETAL (in utero) ---------------------------------------------------------
+  // A fetus and a preterm neonate of the same gestational age and weight have radically
+  // different normal ranges, so these cannot be reached by gestational age alone — see
+  // selectProfile's `fetal` argument below.
+  //
+  // Two things read oddly on purpose:
+  //   - pap_* sits ABOVE map. That is correct in utero: pulmonary pressure at or above
+  //     systemic is what drives the duct right-to-left. PAP < MAP means the circulation
+  //     has broken, not that the patient is well.
+  //   - `spo2_pre` is Monitor.sao2_pre = AA.so2. "Pre-ductal" is not a fetal concept, but
+  //     AA is the physiologically meaningful upper-body/cerebral saturation, so the
+  //     compartment is right even though the label is not.
+  //
+  // `rr` and `etco2` are deliberately OMITTED rather than set to [0,0]: the fetus is
+  // apnoeic and the lung is inert, so they are not-applicable rather than out-of-range.
+  // flagOf() returns "" for an absent key, which prints blank instead of a false LOW.
+  //
+  // These are calibration guard-rails, not diagnostic criteria, and are deliberately wide.
+  fetus_30: {
+    hr: [130, 165], sys: [38, 55], dia: [22, 35], map: [30, 42],
+    pap_s: [45, 70], pap_d: [28, 45], pap_m: [36, 52], cvp: [1, 5],
+    spo2_pre: [55, 75], svo2: [40, 60], temp: [36.5, 37.5],
+    ph: [7.32, 7.42], pco2: [38, 50], po2: [18, 30], hco3: [18, 24], be: [-4, 2],
+  },
+  fetus_term: {
+    hr: [120, 160], sys: [55, 75], dia: [35, 50], map: [45, 60],
+    pap_s: [55, 80], pap_d: [40, 60], pap_m: [48, 68], cvp: [2, 6],
+    spo2_pre: [55, 75], svo2: [40, 60], temp: [36.5, 37.5],
+    ph: [7.32, 7.42], pco2: [38, 52], po2: [18, 32], hco3: [18, 24], be: [-5, 2],
+  },
 };
 
 // pick a normal-range profile from body weight (term neonate ≈ 3.5 kg) unless
 // overridden; gestational age narrows preterm babies onto the matching table.
-export function selectProfile({ weight, gestational_age, profile } = {}) {
+// Is this a fetus in utero? Verified unambiguous across the shipped scenario library: only
+// term_fetus / fetus_*wk have the placenta running with the cord unclamped; every neonatal and
+// adult scenario has placenta_running=false, umb_clamped=true. Takes either a live model or a
+// model_definition (both expose .models).
+export function isFetal(model) {
+  const P = model?.models?.Placenta;
+  return !!(P && P.placenta_running === true && P.umb_clamped === false);
+}
+
+// `fetal` must be passed explicitly by a caller that knows (via isFetal, or a spec flag): a 30 wk
+// fetus and a 30 wk preterm neonate share a gestational age and a weight but not their normal
+// ranges, so neither GA nor weight can separate them. An explicit `profile` still wins over both.
+export function selectProfile({ weight, gestational_age, profile, fetal = false } = {}) {
   if (profile && RANGES[profile]) return profile;
+  if (fetal) {
+    const ga = Math.round(gestational_age ?? 40);
+    if (ga >= 37) return "fetus_term";
+    return RANGES[`fetus_${ga}`] ? `fetus_${ga}` : "fetus_30";
+  }
   if (typeof gestational_age === "number" && gestational_age < 37) {
     const ga = Math.max(24, Math.min(36, Math.round(gestational_age)));
     // snap to the nearest defined preterm table (24,26,28,30,32,34,36)

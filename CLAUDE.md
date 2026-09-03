@@ -50,6 +50,7 @@ node scripts/probe_vitals.mjs preterm_28wk --profile preterm_28
 node scripts/probe_vitals.mjs adult_female --no-ans --seconds 90
 node scripts/probe_pda.mjs preterm_28wk --beats 6
 npm run probe                                          # the one wired script — just probe_fetus.mjs
+node scripts/probe_fetus.mjs fetus_30wk                 # probe_fetus takes an optional scenario stem
 ```
 
 Scenario arguments are filename stems from `model_definitions/` **without `.json`**

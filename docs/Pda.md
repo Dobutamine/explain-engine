@@ -173,6 +173,11 @@ circuit compartment (not owned by the Pda).
 
 ## Usage notes
 
+- **`diameter_ao_max` / `diameter_pa_max` / `length` are absolute millimetres that no scaler
+  touches, and `diameter_relative` is a `[0..1]` patency fraction, not a size.** A scenario
+  scaled to a smaller body keeps a term-sized duct unless the millimetres are set explicitly.
+  The gestational regressions quoted above are what the fetal scenarios use for this; see
+  [fetal_circulation.md](./fetal_circulation.md).
 - **Closure is symmetric in this model.** Real PDA closure proceeds from the pulmonary end first, but the current implementation scales both `diameter_ao` and `diameter_pa` by the same `diameter_relative`. Asymmetric closure would require independent scaling factors.
 - **`velocity_doppler` is the value to monitor** — it is the honest jet peak across both open and restrictive regimes (it equals continuity `Q/A_eff` through the effective orifice). `velocity_pa`/`velocity_ao` remain as anatomic continuity bulk means for reference. Some older model definitions still watch `Pda.velocity_pa`; consider repointing the chart channel to `velocity_doppler`.
 - **A restrictive jet requires an orifice-like (short) throat `length`.** Because the viscous term scales with `length` (Poiseuille over the cone) while the Bernoulli term does not, a long, narrow duct is viscous-limited and will *not* jet — flow and velocity both stay low even at a large trans-ductal gradient (this is physically correct, and is what makes the new element honest where the old `√(full gradient/4)` over-reported). To model a restrictive/closing PDA, set `length` to the throat length (~1–2 mm) and tune `discharge_coeff` (lower → tighter jet). The `preterm_28wk_restrictive_pda` scenario uses `length = 1.5`, `discharge_coeff = 0.5` (≈2.5 m/s continuous L→R, low pulsatility).

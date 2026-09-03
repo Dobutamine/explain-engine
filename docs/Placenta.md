@@ -131,6 +131,35 @@ From `term_fetus.json` (placenta running, cord unclamped):
 
 ## Notes & caveats
 
+- **Gestational age is not a parameter of this model.** Every constant here is anchored at term
+  (the literature comments cite 37–39 week measurements: cord 55 cm, umbilical-artery CSA
+  0.147 cm²). Nothing in the engine reads `model.gestational_age`. Gestation-specific fetal
+  scenarios therefore set these props explicitly from a per-GA table in
+  [`scripts/_ga_tables.mjs`](../scripts/_ga_tables.mjs), applied by
+  [`scripts/_make_fetus.mjs`](../scripts/_make_fetus.mjs) — see
+  [fetal_circulation.md](./fetal_circulation.md).
+- **The coordinator props are the levers — not the sub-models.** `calc_model` rewrites
+  `PL_GASEX.dif_o2`/`dif_co2` from `this.dif_o2`/`dif_co2`, and `PL_MAT.to2`/`tco2` from
+  `mat_to2`/`mat_tco2`, on **every** step. Writing to `PL_GASEX.dif_o2` or `PL_MAT.to2` directly is
+  silently clobbered. Likewise the umbilical/fetal-placental resistors are rewritten from
+  `umb_art_res`/`umb_ven_res`/`plf_res` (times their `*_factor` multipliers, which are plain
+  persistent props — set once, never reset per step).
+- **Gas exchange sits on a full-equilibration plateau.** At the shipped fetal settings the exchanger
+  equilibrates fetal capillary blood essentially completely to the maternal pool (umbilical-vein
+  pCO₂ equals `PL_MAT` pCO₂ exactly). So `mat_to2`/`mat_tco2` are the *effective* gas setpoints and
+  `dif_o2`/`dif_co2` have little authority — raising them changes almost nothing. Calibrate fetal
+  oxygenation and pCO₂ through the maternal contents.
+- **`PL_*` compartments are outside every scaler group.** No placental compartment appears anywhere
+  in a scenario's `scaler_config`, so `ModelScaler.scale_to_weight` does **not** shrink the placenta.
+  A fetus scaled to a smaller weight keeps a term-sized placental blood volume unless it is trimmed
+  explicitly (at 30 wk that is the difference between 164 and 122 mL/kg of fetoplacental blood).
+- **`PL_MAT` holds the *mother's* blood, and `Blood` writes to it.** `Blood.set_solute()` and
+  `Blood.set_P50()` propagate to every registered blood component, `PL_MAT` included. Setting a
+  fetal haemoglobin or unmeasured-anion value therefore changes the maternal pool too — and because
+  `mat_to2` pins its O₂ *content*, lowering its haemoglobin below the implied carrying capacity
+  drives the pool to 100% saturation with a wildly unphysiological dissolved pO₂, which then
+  propagates down the umbilical vein. Snapshot and restore `PL_MAT.P50_0` and `PL_MAT.solutes`
+  after any such write (`_make_fetus.mjs` §E and `build_patient.mjs`'s `restoreMaternalPool()` do).
 - **Two independent off-switches.** `placenta_running = false` disables every sub-model (flow *and*
   gas exchange stop). `umb_clamped = true` stops flow only (via `no_flow`) while the placenta keeps
   running — useful to model cord occlusion with the unit otherwise intact.

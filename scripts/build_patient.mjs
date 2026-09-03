@@ -19,6 +19,8 @@
 // SPEC schema (all fields optional except `baseline`):
 //   {
 //     "baseline": "term_neonate",          // a name in model_definitions/
+//     "fetal": true,                       // force fetal mode (default: auto-detected from the
+//                                          //   baseline — see "FETAL MODE" below)
 //     "name": "custom_patient",            // output scenario name (metadata)
 //     "description": "...",                // output description (auto-generated if absent)
 //     "targets": {                          // only listed vitals are calibrated
@@ -35,6 +37,21 @@
 //     "max_iters": 12, "warm_seconds": 45, "settle_seconds": 90, "final_seconds": 200
 //   }
 //
+// FETAL MODE. A fetal baseline (term_fetus, fetus_<ga>wk) is auto-detected and changes three
+// things, because the neonatal levers are actively wrong on a fetus:
+//   - the gestational-age seed comes from FETAL, not PRETERM_SEED. The preterm seed would set
+//     Shunts.ips_res = 2200 (reopening the intrapulmonary shunts the fetus needs closed at 1e8)
+//     and Pda.diameter_relative = 0.36 (constricting a duct that must be wide open). Both
+//     silently destroy the fetal circulation while still building and still printing a
+//     plausible-looking panel.
+//   - the RDS lung phenotype is skipped entirely (the fetal lung is fluid-filled and inert).
+//   - PO2/SpO2 and pCO2 are driven from Placenta.mat_to2 / mat_tco2 instead of the alveolar
+//     diffusors and the ventilatory drive, both of which are no-ops in a fetus (GASEX dif_* are 0,
+//     Breathing is disabled).
+// Blood.set_solute / set_P50 reach the MATERNAL pool PL_MAT as well, so fetal mode snapshots and
+// restores it after every such write — otherwise the BE/pH controller acidifies the mother and
+// shifts the placental gradient under the O2 controller's feet.
+//
 // Units mirror the monitor/ABG the app shows: pressures mmHg, SpO2/SvO2 %, temp °C,
 // pH unitless, pCO2/pO2 mmHg, BE mmol/L, weight kg, height m, CO L/min. Hb is
 // mmol/L (the model's unit) — pass `hb` in mmol/L, or `hb_gdl` in g/dL to convert.
@@ -42,7 +59,8 @@
 import fs from "node:fs";
 import { createEngine } from "./_harness.mjs";
 import { serializeState } from "./_serialize_state.mjs";
-import { measureVitals, selectProfile, RANGES, flagOf } from "./_probe.mjs";
+import { measureVitals, selectProfile, RANGES, flagOf, isFetal } from "./_probe.mjs";
+import { FETAL, nearestFetalGa } from "./_ga_tables.mjs";
 import { makeController, runCalibration } from "../helpers/Calibrator.js";
 
 // ---------------------------------------------------------------------------
@@ -128,15 +146,36 @@ if (!model || !model.models) {
 const trace = (...a) => console.error(...a);
 const has = (k) => targets[k] != null;
 
+// fetal vs neonatal baseline. Sniff the baseline JSON (before any structural pass) so the branch
+// is decided up front; an explicit spec.fetal overrides.
+const FETAL_MODE = spec.fetal != null ? !!spec.fetal : isFetal(baseJson.model_definition || baseJson);
+trace(`fetal mode: ${FETAL_MODE ? "ON" : "off"} (${spec.fetal != null ? "spec" : "detected from baseline"})`);
+
+// the maternal placental pool is not the patient. Blood.set_solute()/set_P50() propagate to every
+// registered blood component INCLUDING PL_MAT, so snapshot it and restore after any such write.
+const matSnap = FETAL_MODE && model.models.PL_MAT
+  ? { P50_0: model.models.PL_MAT.P50_0, solutes: { ...model.models.PL_MAT.solutes } }
+  : null;
+const restoreMaternalPool = () => {
+  if (!matSnap) return;
+  const plm = model.models.PL_MAT;
+  plm.P50_0 = matSnap.P50_0;
+  Object.assign(plm.solutes, matSnap.solutes);
+};
+
 // gestational-age seed bundle (used to seed both structure and starting lever values)
 let seed = null;
-if (has("gestational_age") && targets.gestational_age < 37) {
+if (FETAL_MODE) {
+  seed = FETAL[nearestFetalGa(has("gestational_age") ? targets.gestational_age : 40)];
+} else if (has("gestational_age") && targets.gestational_age < 37) {
   seed = PRETERM_SEED[nearestGa(targets.gestational_age)];
 }
 
-// weight: allometric volume scaling (scale_to_weight sets model.weight too). Apply
-// FIRST — weight_scale resets systemic/pulmonary resistance scaling to 1.0, so the
-// SVR/PVR levers below (and the iterative controllers) must come after it.
+// weight: allometric volume scaling (scale_to_weight sets model.weight too). Apply FIRST —
+// _scale_vol multiplies vol AND u_vol on every listed compartment, so any absolute per-compartment
+// volume edit (the venous preload trim, the fetal placental trim) must come after it to be a trim
+// on the already-scaled value. NOTE scale_to_weight does NOT reset resistance scaling — every
+// elastance/resistance line in it is commented out, so it moves volumes only.
 const weightKg = has("weight") ? targets.weight : seed ? seed.weight : null;
 if (weightKg != null) {
   eng.scale("weight_scale", weightKg);
@@ -149,7 +188,27 @@ if (has("gestational_age")) model.gestational_age = targets.gestational_age;
 if (has("age")) model.age = targets.age;
 
 // pathophysiology + GA-seed RDS lung phenotype (stiff, low-FRC, reduced diffusion)
-const rds = patho.rds ? RDS_BUNDLE[patho.rds] : seed ? { rds_el: seed.rds_el, rds_uvol: seed.rds_uvol, gasex: seed.gasex, ips_res: seed.ips_res } : null;
+// The placenta is invisible to scale_to_weight (no PL_* compartment appears in scaler_config), so
+// a scaled fetus keeps a term-sized placenta unless it is trimmed explicitly.
+if (FETAL_MODE && seed?.pl_vol != null && weightKg != null) {
+  for (const n of ["PL_UMB_ART", "PL_FETAL_ART", "PL_FETAL_CAP", "PL_FETAL_VEN", "PL_UMB_VEN"]) {
+    const c = model.models[n];
+    if (!c) continue;
+    if (typeof c.vol === "number") c.vol *= seed.pl_vol;
+    if (typeof c.u_vol === "number") c.u_vol *= seed.pl_vol;
+  }
+  const plm = model.models.PL_MAT;
+  if (plm && seed.mat_vol != null) { plm.vol *= seed.mat_vol; plm.u_vol *= seed.mat_vol; }
+  trace(`structural: placental volume x${seed.pl_vol} (fetal), PL_MAT x${seed.mat_vol}`);
+}
+
+// RDS is a neonatal lung phenotype and must never touch a fetus: the fetal lung is fluid-filled and
+// inert, and the bundle's ips_res write would reopen the intrapulmonary shunts.
+if (FETAL_MODE && patho.rds) {
+  console.error(`build_patient: pathophysiology.rds is meaningless on a fetal baseline ("${baseline}") — the fetal lung is inert.`);
+  process.exit(1);
+}
+const rds = FETAL_MODE ? null : patho.rds ? RDS_BUNDLE[patho.rds] : seed ? { rds_el: seed.rds_el, rds_uvol: seed.rds_uvol, gasex: seed.gasex, ips_res: seed.ips_res } : null;
 if (rds) {
   for (const n of ["ALL", "ALR"]) {
     const c = model.models[n];
@@ -178,8 +237,25 @@ if (seed) {
 }
 
 // patent ductus
-const pda = has("pda") ? targets.pda : seed ? seed.pda : null;
-if (pda != null && model.models.Pda) { model.models.Pda.diameter_relative = pda; trace(`structural: PDA diameter_relative ${pda}`); }
+if (FETAL_MODE) {
+  // The fetal duct is fully relaxed in utero: diameter_relative is a [0..1] PATENCY fraction and
+  // stays 1.0 at every gestation. The SIZE levers are the anatomic millimetres, which no scaler
+  // touches — without them a scaled fetus keeps a term-sized duct and foramen.
+  if (has("pda")) {
+    console.error(`build_patient: targets.pda is not a fetal knob — the fetal duct is wide open. Use a named ductal-constriction pathophysiology instead.`);
+    process.exit(1);
+  }
+  const P = model.models.Pda, S = model.models.Shunts;
+  if (P && seed?.da_diam != null) { P.diameter_ao_max = seed.da_diam; P.diameter_pa_max = seed.da_diam; P.length = seed.da_len; P.diameter_relative = 1.0; }
+  if (S && seed?.fo != null) { S.diameter_fo = seed.fo; S.atrial_septal_width = seed.fo_septum; }
+  trace(`structural: fetal shunt anatomy — duct ${seed?.da_diam} mm x ${seed?.da_len} mm (relative 1.0), FO ${seed?.fo} mm`);
+  // placental bed
+  const PL = model.models.Placenta;
+  if (PL && seed?.umb_art_res != null) { PL.umb_art_res = seed.umb_art_res; PL.plf_res = seed.plf_res; PL.dif_o2 = seed.dif_o2; PL.dif_co2 = seed.dif_co2; }
+} else {
+  const pda = has("pda") ? targets.pda : seed ? seed.pda : null;
+  if (pda != null && model.models.Pda) { model.models.Pda.diameter_relative = pda; trace(`structural: PDA diameter_relative ${pda}`); }
+}
 
 // hemoglobin — the model's unit is mmol/L. Accept `hb` (mmol/L) directly, or
 // `hb_gdl` (g/dL) which is converted (1 g/dL = 0.6206 mmol/L). The model NEVER
@@ -187,6 +263,7 @@ if (pda != null && model.models.Pda) { model.models.Pda.diameter_relative = pda;
 if (model.models.Blood && (has("hb") || has("hb_gdl"))) {
   const hbMmol = has("hb") ? targets.hb : targets.hb_gdl * 0.6206;
   model.models.Blood.set_solute("hemoglobin", hbMmol);
+  restoreMaternalPool(); // PL_MAT is the mother's blood — her Hb does not follow the fetus's
   trace(`structural: Hb ${round(hbMmol, 2)} mmol/L${!has("hb") && has("hb_gdl") ? ` (converted from ${targets.hb_gdl} g/dL)` : ""}`);
 }
 
@@ -198,6 +275,15 @@ if (has("map") && model.models.BR_MAP) { model.models.BR_MAP.set_value = targets
 
 // heart-rate reference seed (also an iterated lever below if hr is targeted)
 if (seed && model.models.Heart && !has("hr")) model.models.Heart.heart_rate_ref = seed.hr_ref;
+// the baroreflex must defend the gestation's own MAP when the spec does not name one, or it drives
+// permanent reflex tachycardia (the fetal setpoint is 50 at term, far above a 30 wk target)
+if (seed?.br_map != null && !has("map") && model.models.BR_MAP) model.models.BR_MAP.set_value = seed.br_map;
+// fetal haemoglobin affinity (HbF), maternal pool excluded
+if (FETAL_MODE && seed?.p50 != null && model.models.Blood) {
+  if (model.models.Blood.set_P50) model.models.Blood.set_P50(seed.p50); else model.models.Blood.P50_0 = seed.p50;
+  restoreMaternalPool();
+  trace(`structural: fetal P50 ${seed.p50} (PL_MAT kept maternal)`);
+}
 
 // ---------------------------------------------------------------------------
 // 3. controllers (one lever per off-target vital) — applied iteratively
@@ -242,11 +328,23 @@ if (has("co")) {
   const apply = (f) => { for (const n of ["LV", "RV"]) { const m = model.models[n]; if (m) m.el_max_factor_ps = f; } };
   controllers.push(mkc({ key: "co", lo: 0.3, hi: 3, sign: +1, gain: 0.8, value: 1.0, set: apply }));
 }
-// PO2 / SpO2 <- alveolar O2 diffusion persistent factor (↑dif ↑PO2)
+// PO2 / SpO2 <- alveolar O2 diffusion persistent factor (↑dif ↑PO2); in a FETUS the alveolar
+// diffusors are inert (dif_o2 = 0, so the factor multiplies into zero — a complete no-op that would
+// burn every iteration on a lever that cannot move the measurement). The fetal setpoint is the
+// maternal pool's O2 content: Placenta.calc_model() writes mat_to2 onto PL_MAT every step and the
+// exchanger nearly fully equilibrates fetal capillary blood to it, so mat_to2 IS the achievable
+// umbilical-vein oxygen content. It reaches arterial (AA) saturation only indirectly via the
+// UV -> ductus venosus -> foramen ovale -> LA path, hence the small gain.
 if (has("po2") || has("spo2")) {
   const key = has("po2") ? "po2" : "spo2";
-  const apply = (f) => { for (const n of ["GASEX_LL", "GASEX_RL"]) { const m = model.models[n]; if (m) m.dif_o2_factor_ps = f; } };
-  controllers.push(mkc({ key, lo: 0.1, hi: 8, sign: +1, gain: key === "po2" ? 0.03 : 0.06, value: 1.0, set: apply }));
+  if (FETAL_MODE) {
+    const P = model.models.Placenta;
+    controllers.push(mkc({ key, lo: 4.0, hi: 10.0, sign: +1, gain: key === "po2" ? 0.05 : 0.03,
+      value: P.mat_to2, set: (v) => { P.mat_to2 = v; } }));
+  } else {
+    const apply = (f) => { for (const n of ["GASEX_LL", "GASEX_RL"]) { const m = model.models[n]; if (m) m.dif_o2_factor_ps = f; } };
+    controllers.push(mkc({ key, lo: 0.1, hi: 8, sign: +1, gain: key === "po2" ? 0.03 : 0.06, value: 1.0, set: apply }));
+  }
 }
 // pCO2 <- spontaneous ventilatory drive (Breathing.minute_volume_ref multiplier).
 // ↓drive ↑pCO2 -> sign -1. This is the lever that actually shifts the *regulated*
@@ -254,7 +352,14 @@ if (has("po2") || has("spo2")) {
 // pCO2 setpoint, so gas-exchange dif_co2 alone is fought back to baseline — only
 // changing the drive moves steady-state pCO2. (Assumes spontaneous breathing; for
 // a ventilated baseline the bot sets ventilator rate/Vt instead.)
-if (has("pco2") && model.models.Breathing) {
+// In a FETUS this lever is inert (Breathing.is_enabled = false). The fetal equivalent is the
+// maternal pool's CO2 content: a higher maternal CO2 content means a smaller placental gradient and
+// therefore LESS clearance, so fetal pCO2 rises with mat_tco2 (sign +1 — verified empirically with
+// `probe_fetus.mjs <scenario> --mattco2`, not asserted from reading).
+if (has("pco2") && FETAL_MODE) {
+  const P = model.models.Placenta;
+  controllers.push(mkc({ key: "pco2", lo: 14, hi: 30, sign: +1, gain: 0.15, value: P.mat_tco2, set: (v) => { P.mat_tco2 = v; } }));
+} else if (has("pco2") && model.models.Breathing) {
   const B = model.models.Breathing;
   const baseMv = B.minute_volume_ref;
   const apply = (mult) => { B.minute_volume_ref = baseMv * mult; };
@@ -264,14 +369,17 @@ if (has("pco2") && model.models.Breathing) {
 if (has("be") || has("ph")) {
   const key = has("be") ? "be" : "ph";
   const startUma = model.models.AA?.solutes?.uma ?? 0;
-  const apply = (v) => { if (model.models.Blood) model.models.Blood.set_solute("uma", Math.max(0, v)); };
+  const apply = (v) => {
+    if (model.models.Blood) model.models.Blood.set_solute("uma", Math.max(0, v));
+    restoreMaternalPool(); // set_solute reaches PL_MAT; the mother is not the patient
+  };
   controllers.push(mkc({ key, lo: 0, hi: 40, sign: -1, gain: key === "be" ? 0.8 : 18, value: startUma, set: apply }));
 }
 
 // ---------------------------------------------------------------------------
 // 4. calibration loop
 // ---------------------------------------------------------------------------
-const profile = selectProfile({ weight: model.weight, gestational_age: model.gestational_age, profile: spec.profile });
+const profile = selectProfile({ weight: model.weight, gestational_age: model.gestational_age, profile: spec.profile, fetal: FETAL_MODE });
 const ranges = RANGES[profile] || RANGES.adult;
 trace(`\ncalibrating "${spec.name || baseline}" (baseline ${baseline}, profile ${profile}) — ${controllers.length} target(s)`);
 

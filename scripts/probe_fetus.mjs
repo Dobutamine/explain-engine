@@ -1,4 +1,4 @@
-// Fetal-circulation probe for term_fetus.json.
+// Fetal-circulation probe for the fetal scenarios (term_fetus, fetus_<ga>wk).
 //
 // Warms up the scenario, then reports the panel needed to calibrate fetal circulation:
 //   - vitals (HR, ABP, PAP, CVP) and combined ventricular output (RV:LV split)
@@ -6,7 +6,10 @@
 //   - the fetal oxygenation gradient: umbilical vein > ascending aorta > descending aorta > umbilical artery
 //
 // Usage:
-//   node scripts/probe_fetus.mjs [--seconds N] [--window W] [--no-ans] [--verbose]
+//   node scripts/probe_fetus.mjs [scenario] [--seconds N] [--window W] [--no-ans] [--verbose]
+//
+// `scenario` is a filename stem from model_definitions/ without .json, defaulting to term_fetus
+// (e.g. `node scripts/probe_fetus.mjs fetus_30wk`).
 //
 // Live calibration overrides (applied before warm-up, mutate the live model):
 //   --fo MM           foramen ovale diameter (Shunts.diameter_fo)
@@ -20,6 +23,14 @@
 //   --hb X            fetal hemoglobin (mmol/L, via Blood.set_solute)
 //   --uma X           unmeasured anions (acid-base, via Blood.set_solute)
 //   --hrref BPM       Heart.heart_rate_ref
+//   --contract X      SYMMETRIC contractility: el_max_factor_ps on BOTH LV and RV
+//   --contract-right X  Heart.cont_factor_right — the ventricular-dominance lever. The atrial split
+//                     follows whichever ventricle ejects better, because the foramen is effectively
+//                     unrestrictive; --fo does NOT move the split between 3 and 6 mm.
+//   --contract-left X   Heart.cont_factor_left
+//   --rvuvol X        multiplier on RV.u_vol — sets RV ejection fraction, NOT the split
+//   --venuvol X       multiplier on VLB/VUB u_vol (venous preload)
+//   --bloodvol X      multiplier on every blood compartment's volume
 
 import fs from "node:fs";
 import { register } from "node:module";
@@ -29,6 +40,9 @@ import { calc_blood_composition } from "../component_models/BloodComposition.js"
 const argv = process.argv.slice(2);
 const flag = (n) => argv.includes(n);
 const opt = (n, d) => { const i = argv.indexOf(n); return i >= 0 && argv[i + 1] !== undefined ? Number(argv[i + 1]) : d; };
+// only argv[0] may be the scenario stem: argv.find(a => !a.startsWith("-")) would pick up a
+// flag VALUE (e.g. "4.3" from `--fo 4.3`) and try to load it as a scenario.
+const SCENARIO = argv[0] && !argv[0].startsWith("-") ? argv[0] : "term_fetus";
 const SECONDS = opt("--seconds", 120);
 const WINDOW = opt("--window", 20);
 const VERBOSE = flag("--verbose");
@@ -46,12 +60,12 @@ if (!VERBOSE) console.log = () => {};
 await import("../ModelEngine.js");
 const send = (type, message, payload) => self.onmessage({ data: { type, message, payload } });
 
-const path = new URL("../model_definitions/term_fetus.json", import.meta.url);
+const path = new URL(`../model_definitions/${SCENARIO}.json`, import.meta.url);
 const json = JSON.parse(fs.readFileSync(path, "utf8"));
 send("POST", "build", json.model_definition || json);
 send("GET", "state", []);
 const model = liveModel;
-if (!model || !model.models) { console.log = _log; console.error("Build failed for term_fetus."); process.exit(1); }
+if (!model || !model.models) { console.log = _log; console.error(`Build failed for "${SCENARIO}".`); process.exit(1); }
 const M = model.models;
 const weight = model.weight;
 
@@ -79,6 +93,10 @@ if (opt("--p50", null) != null && M.Blood?.set_P50) { M.Blood.set_P50(opt("--p50
 if (opt("--hrref", null) != null) M.Heart.heart_rate_ref = opt("--hrref", null);
 const contract = opt("--contract", null);
 if (contract != null) for (const n of ["LV", "RV"]) { const m = M[n]; if (m) m.el_max_factor_ps = contract; }
+// asymmetric inotropy — the lever that actually sets RV:LV dominance
+if (opt("--contract-right", null) != null && M.Heart) M.Heart.cont_factor_right = opt("--contract-right", null);
+if (opt("--contract-left", null) != null && M.Heart) M.Heart.cont_factor_left = opt("--contract-left", null);
+if (opt("--rvuvol", null) != null && M.RV) M.RV.u_vol *= opt("--rvuvol", null);
 const venuvol = opt("--venuvol", null);
 if (venuvol != null) for (const n of ["VLB", "VUB"]) { const m = M[n]; if (m) m.u_vol *= venuvol; }
 const bloodvol = opt("--bloodvol", null);
@@ -127,7 +145,7 @@ const Lmin = (q) => (q || 0) * 60;                               // L/s -> L/min
 const ml = (q) => (q || 0) * 60 * 1000;                          // L/s -> mL/min
 const pct = (q) => cvo_Lmin ? (Lmin(q) / cvo_Lmin) * 100 : 0;
 
-console.log(`\n=== term_fetus (weight ${weight} kg, ANS ${M.Ans?.is_enabled ? "ON" : "OFF"}, warmup ${SECONDS}s) ===\n`);
+console.log(`\n=== ${SCENARIO} (weight ${weight} kg, GA ${model.gestational_age} wk, ANS ${M.Ans?.is_enabled ? "ON" : "OFF"}, warmup ${SECONDS}s) ===\n`);
 console.log("-- Hemodynamics --");
 console.log(`Heart rate            ${String(r(acc.hr)).padStart(7)} bpm`);
 console.log(`ABP (AA) sys/dia/map  ${String(r(acc.sys)).padStart(7)} / ${r(acc.dia)} / ${r(acc.map)} mmHg`);
